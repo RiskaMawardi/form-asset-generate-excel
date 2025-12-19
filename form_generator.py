@@ -31,6 +31,22 @@ class SimpleExcelGenerator:
             os.makedirs(self.temp_image_folder, exist_ok=True)
         if self.enable_pdf:
             os.makedirs(self.pdf_folder, exist_ok=True)
+
+    def extract_year_from_asset_no(self, asset_no):
+        """
+        Extract year (19xx or 20xx) from asset number
+        Example:
+        - CO4/A15/EDP/03/2013 -> 2013
+        - M2022/07/IT/00717  -> 2022
+        """
+        if not asset_no:
+            return ''
+
+        match = re.search(r'(19|20)\d{2}', str(asset_no))
+        if match:
+            return match.group(0)
+
+        return ''
     
     def download_image_from_gdrive(self, url):
         """Download image from Google Drive URL"""
@@ -302,8 +318,12 @@ class SimpleExcelGenerator:
                 ws[f'A{row_num}'] = idx + 1  # Nomor urut (1, 2, 3, ...)
                 ws[f'B{row_num}'] = asset['jenis']  # Jenis Inventaris
                 ws[f'C{row_num}'] = asset['no']     # No. Asset
-                ws[f'F{row_num}'] = person_info.get('Nama', '')  # Nama
+                ws[f'F{row_num}'] = person_info.get('Dipakai Oleh', '')  # Nama
                 ws[f'G{row_num}'] = person_info.get('Jabatan', '')  # Jabatan
+                ws[f'H{row_num}'] = person_info.get('Kondisi Inventaris', '')  # Kondisi Inventaris
+
+                tahun_asset = self.extract_year_from_asset_no(asset['no'])
+                ws[f'E{row_num}'] = tahun_asset
                 
                 # Insert image if URL exists and insert_images is enabled
                 if self.insert_images and asset['foto'] and asset['foto'].startswith('http'):
@@ -502,7 +522,7 @@ class SimpleExcelGenerator:
         
         # Group by person
         df['person_key'] = (
-            df.get('Nama', 'Unknown').fillna('Unknown') + '_' +
+            df.get('Dipakai Oleh', 'Unknown').fillna('Unknown') + '_' +
             df.get('Divisi', 'Unknown').fillna('Unknown') + '_' +
             df.get('Area', 'Unknown').fillna('Unknown')
         )
@@ -517,12 +537,13 @@ class SimpleExcelGenerator:
                 grouped[person_key] = {
                     'info': {
                         'Timestamp': row.get('Timestamp', ''),
-                        'Nama': row.get('Nama', 'Unknown'),
+                        'Dipakai Oleh': row.get('Dipakai Oleh', 'Unknown'),
                         'Divisi': row.get('Divisi', 'Unknown'),
                         'Area': row.get('Area', 'Unknown'),
                         'PIC': row.get('PIC', 'Unknown'),
                         'Dibuat Oleh': row.get('Dibuat Oleh', ''),
-                        'Jabatan': row.get('Jabatan', '')
+                        'Jabatan': row.get('Jabatan', ''),
+                        'Kondisi Inventaris': row.get('Kondisi Inventaris', '')
                     },
                     'assets': []
                 }
@@ -538,7 +559,7 @@ class SimpleExcelGenerator:
             assets = data['assets']
             
             # Create filename
-            nama = str(info['Nama']).replace(' ', '_')
+            nama = str(info['Dipakai Oleh']).replace(' ', '_')
             area = str(info['Area']).replace(' ', '_').replace('(', '').replace(')', '').replace('.', '')
             divisi = str(info['Divisi']).replace(' ', '_')
             
@@ -594,6 +615,8 @@ class SimpleExcelGenerator:
                 df = df.rename(columns={col: 'PIC'})
             elif 'dibuat' in col.lower() and 'oleh' in col.lower():
                 df = df.rename(columns={col: 'Dibuat Oleh'})
+            elif 'kondisi' in col.lower() and 'inventaris' in col.lower():
+                df = df.rename(columns={col: 'Kondisi Inventaris'})
             elif 'jabatan' in col.lower():
                 df = df.rename(columns={col: 'Jabatan'})
         
@@ -603,7 +626,7 @@ class SimpleExcelGenerator:
         for idx, (_, row) in enumerate(df.iterrows(), 1):
             info = {
                 'Timestamp': row.get('Timestamp', ''),
-                'Nama': row.get('Nama', 'Unknown'),
+                'Dipakai Oleh': row.get('Dipakai Oleh', 'Unknown'),
                 'Divisi': row.get('Divisi', 'Unknown'),
                 'Area': row.get('Area', 'Unknown'),
                 'PIC': row.get('PIC', 'Unknown'),
@@ -614,7 +637,7 @@ class SimpleExcelGenerator:
             assets = self.extract_assets_from_row(row)
             
             # Create filename
-            nama = str(info['Nama']).replace(' ', '_')
+            nama = str(info['Dipakai Oleh']).replace(' ', '_')
             area = str(info['Area']).replace(' ', '_').replace('(', '').replace(')', '').replace('.', '')
             
             filename = f"{idx}_{area}_{nama}_{len(assets)}assets.xlsx"
