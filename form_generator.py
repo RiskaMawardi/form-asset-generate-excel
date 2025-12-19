@@ -8,18 +8,29 @@ import re
 import requests
 from io import BytesIO
 from PIL import Image as PILImage
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 class SimpleExcelGenerator:
-    def __init__(self, csv_file, template_file, output_folder='generated_excel', insert_images=True):
+    def __init__(self, csv_file, template_file, output_folder='generated_excel', insert_images=True, generate_pdf=True):
         self.csv_file = csv_file
         self.template_file = template_file
         self.output_folder = output_folder
         self.insert_images = insert_images
+        self.enable_pdf = generate_pdf  # Changed from self.generate_pdf to avoid conflict
         self.temp_image_folder = os.path.join(output_folder, 'temp_images')
+        self.pdf_folder = os.path.join(output_folder, 'pdf_output')
         
         os.makedirs(output_folder, exist_ok=True)
         if insert_images:
             os.makedirs(self.temp_image_folder, exist_ok=True)
+        if self.enable_pdf:
+            os.makedirs(self.pdf_folder, exist_ok=True)
     
     def download_image_from_gdrive(self, url):
         """Download image from Google Drive URL"""
@@ -38,34 +49,101 @@ class SimpleExcelGenerator:
                 print(f"   WARNING: Could not extract file ID from URL: {url}")
                 return None
             
-            # Download URL for Google Drive
-            download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            # Check if image already downloaded
+            temp_filename = f"{file_id}.png"
+            temp_path = os.path.join(self.temp_image_folder, temp_filename)
             
-            # Download image
-            response = requests.get(download_url, timeout=10)
-            if response.status_code == 200:
-                # Open image with PIL to validate and resize
-                img = PILImage.open(BytesIO(response.content))
-                
-                # Resize image if too large (max width 200px)
-                max_width = 200
-                if img.width > max_width:
-                    ratio = max_width / img.width
-                    new_height = int(img.height * ratio)
-                    img = img.resize((max_width, new_height), PILImage.Resampling.LANCZOS)
-                
-                # Save to temp file
-                temp_filename = f"{file_id}.png"
-                temp_path = os.path.join(self.temp_image_folder, temp_filename)
-                img.save(temp_path, 'PNG')
-                
+            if os.path.exists(temp_path):
+                print(f"      -> Using cached image")
                 return temp_path
-            else:
-                print(f"   WARNING: Failed to download image (status {response.status_code})")
-                return None
+            
+            # Headers to mimic browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
+            
+            # Try multiple download URLs
+            download_urls = [
+                f"https://drive.google.com/uc?export=download&id={file_id}",
+                f"https://drive.usercontent.google.com/download?id={file_id}&export=download",
+                f"https://lh3.googleusercontent.com/d/{file_id}",
+                f"https://drive.google.com/thumbnail?id={file_id}&sz=w1000"
+            ]
+            
+            # Create session with retry
+            session = requests.Session()
+            session.headers.update(headers)
+            
+            # Try each URL with retry logic
+            for attempt, download_url in enumerate(download_urls, 1):
+                try:
+                    print(f"      -> Attempt {attempt}/{len(download_urls)}: {download_url.split('?')[0]}...")
+                    
+                    response = session.get(download_url, timeout=20, allow_redirects=True, verify=True)
+                    
+                    # Check if response is valid
+                    if response.status_code == 200 and len(response.content) > 1000:
+                        # Check content type
+                        content_type = response.headers.get('content-type', '').lower()
+                        
+                        # Skip if HTML (usually error page)
+                        if 'text/html' in content_type:
+                            print(f"      -> Got HTML response, trying next URL...")
+                            continue
+                        
+                        # Try to open as image
+                        try:
+                            img = PILImage.open(BytesIO(response.content))
+                            
+                            # Resize image if too large (max width 200px)
+                            max_width = 200
+                            if img.width > max_width:
+                                ratio = max_width / img.width
+                                new_height = int(img.height * ratio)
+                                img = img.resize((max_width, new_height), PILImage.Resampling.LANCZOS)
+                            
+                            # Save to temp file
+                            img.save(temp_path, 'PNG')
+                            print(f"      -> ✓ Image downloaded successfully!")
+                            return temp_path
+                        
+                        except Exception as img_error:
+                            print(f"      -> Invalid image data, trying next URL...")
+                            continue
+                    
+                    elif response.status_code == 403:
+                        print(f"      -> Access denied (403), trying next URL...")
+                        continue
+                    elif response.status_code == 404:
+                        print(f"      -> File not found (404)")
+                        break  # No point trying other URLs
+                    else:
+                        print(f"      -> HTTP {response.status_code}, trying next URL...")
+                        continue
+                    
+                except requests.exceptions.Timeout:
+                    print(f"      -> Timeout, trying next URL...")
+                    continue
+                except requests.exceptions.ConnectionError as e:
+                    print(f"      -> Connection error: {str(e)[:50]}...")
+                    continue
+                except requests.exceptions.RequestException as e:
+                    print(f"      -> Request failed: {str(e)[:50]}...")
+                    continue
+                except Exception as e:
+                    print(f"      -> Error: {str(e)[:50]}...")
+                    continue
+            
+            print(f"   ✗ All download attempts failed for this image")
+            return None
                 
         except Exception as e:
-            print(f"   WARNING: Error downloading image: {str(e)}")
+            print(f"   ✗ Unexpected error: {str(e)[:100]}")
             return None
     
     def read_csv_responses(self):
@@ -190,19 +268,42 @@ class SimpleExcelGenerator:
         try:
             wb = load_workbook(template_path)
             ws = wb.active
+
+            # Fill year from timestamp in A1
+            timestamp = person_info.get('Timestamp', '')
+            if timestamp:
+                try:
+                    # Try to parse timestamp and extract year
+                    # Format could be: "12/19/2024 10:30:00" or "2024-12-19 10:30:00"
+                    if '/' in timestamp:
+                        year = timestamp.split('/')[-1].split(' ')[0]  # Get year from MM/DD/YYYY
+                    elif '-' in timestamp:
+                        year = timestamp.split('-')[0]  # Get year from YYYY-MM-DD
+                    else:
+                        year = datetime.now().year
+                    
+                    # Get current value in A1 (e.g., "TAHUN ...")
+                    current_a1 = ws['E1'].value or "Tahun ..."
+                    # Replace "..." with the actual year
+                    ws['E1'] = current_a1.replace('...', str(year))
+                except:
+                    # If parsing fails, use current year
+                    current_a1 = ws['E1'].value or "Tahun ..."
+                    ws['E1'] = current_a1.replace('...', str(datetime.now().year))
             
-            # Fill header (G1, G2, D27, J28)
             ws['H1'] = person_info.get('Area', '')
             ws['H2'] = person_info.get('Divisi', '')
-            ws['E27'] = person_info.get('Nama', '')
+            ws['E27'] = person_info.get('Dibuat Oleh', '')
             ws['K28'] = person_info.get('PIC', '')
             
             # Fill assets starting from row 9
             for idx, asset in enumerate(assets):
                 row_num = 9 + idx
+                ws[f'A{row_num}'] = idx + 1  # Nomor urut (1, 2, 3, ...)
                 ws[f'B{row_num}'] = asset['jenis']  # Jenis Inventaris
                 ws[f'C{row_num}'] = asset['no']     # No. Asset
                 ws[f'F{row_num}'] = person_info.get('Nama', '')  # Nama
+                ws[f'G{row_num}'] = person_info.get('Jabatan', '')  # Jabatan
                 
                 # Insert image if URL exists and insert_images is enabled
                 if self.insert_images and asset['foto'] and asset['foto'].startswith('http'):
@@ -235,6 +336,146 @@ class SimpleExcelGenerator:
             print(f"ERROR filling template: {str(e)}")
             return False
     
+    def generate_pdf(self, pdf_path, person_info, assets):
+        """Generate professional PDF document"""
+        try:
+            doc = SimpleDocTemplate(pdf_path, pagesize=landscape(A4),  # Changed to landscape
+                                   rightMargin=2*cm, leftMargin=2*cm,
+                                   topMargin=2*cm, bottomMargin=2*cm)
+            
+            story = []
+            styles = getSampleStyleSheet()
+            
+            # Custom styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=16,
+                textColor=colors.HexColor('#1a1a1a'),
+                spaceAfter=30,
+                alignment=1  # Center
+            )
+            
+            header_style = ParagraphStyle(
+                'CustomHeader',
+                parent=styles['Normal'],
+                fontSize=11,
+                textColor=colors.HexColor('#333333'),
+                spaceAfter=12
+            )
+            
+            # Title
+            timestamp = person_info.get('Timestamp', '')
+            year = datetime.now().year
+            if timestamp:
+                try:
+                    if '/' in timestamp:
+                        year = timestamp.split('/')[-1].split(' ')[0]
+                    elif '-' in timestamp:
+                        year = timestamp.split('-')[0]
+                except:
+                    pass
+            
+            title = Paragraph(f"<b>DAFTAR INVENTARIS TAHUN {year}</b>", title_style)
+            story.append(title)
+            story.append(Spacer(1, 0.5*cm))
+            
+            # Header Information
+            header_data = [
+                ['Area', ':', person_info.get('Area', '')],
+                ['Divisi', ':', person_info.get('Divisi', '')],
+                ['Dibuat Oleh', ':', person_info.get('Dibuat Oleh', '')],
+                ['PIC', ':', person_info.get('PIC', '')]
+            ]
+            
+            header_table = Table(header_data, colWidths=[4*cm, 0.5*cm, 14*cm])  # Wider for landscape
+            header_table.setStyle(TableStyle([
+                ('FONT', (0, 0), (-1, -1), 'Helvetica', 10),
+                ('FONT', (0, 0), (0, -1), 'Helvetica-Bold', 10),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.HexColor('#333333')),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+            ]))
+            
+            story.append(header_table)
+            story.append(Spacer(1, 1*cm))
+            
+            # Assets Table Header
+            table_data = [['No', 'Foto', 'Jenis Inventaris', 'No. Asset', 'Nama', 'Jabatan']]
+            
+            # Assets Data
+            for idx, asset in enumerate(assets):
+                foto_cell = ''
+                
+                # Try to add image if available
+                if self.insert_images and asset['foto'] and asset['foto'].startswith('http'):
+                    image_path = self.download_image_from_gdrive(asset['foto'])
+                    if image_path and os.path.exists(image_path):
+                        try:
+                            img = RLImage(image_path, width=2*cm, height=2*cm)
+                            foto_cell = img
+                        except:
+                            foto_cell = 'N/A'
+                    else:
+                        foto_cell = 'N/A'
+                else:
+                    foto_cell = 'N/A'
+                
+                row = [
+                    str(idx + 1),
+                    foto_cell,
+                    asset['jenis'],
+                    asset['no'],
+                    person_info.get('Nama', ''),
+                    person_info.get('Jabatan', '')
+                ]
+                table_data.append(row)
+            
+            # Create table
+            col_widths = [1*cm, 2.5*cm, 4*cm, 3*cm, 3.5*cm, 3*cm]
+            assets_table = Table(table_data, colWidths=col_widths, repeatRows=1)
+            
+            # Table styling
+            table_style = TableStyle([
+                # Header
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4472C4')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('FONT', (0, 0), (-1, 0), 'Helvetica-Bold', 10),
+                ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, 0), 'MIDDLE'),
+                
+                # Body
+                ('FONT', (0, 1), (-1, -1), 'Helvetica', 9),
+                ('ALIGN', (0, 1), (0, -1), 'CENTER'),  # No column
+                ('ALIGN', (1, 1), (1, -1), 'CENTER'),  # Foto column
+                ('VALIGN', (0, 1), (-1, -1), 'MIDDLE'),
+                
+                # Grid
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('BOX', (0, 0), (-1, -1), 1, colors.black),
+                
+                # Alternating rows
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F2F2F2')]),
+                
+                # Padding
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+            ])
+            
+            assets_table.setStyle(table_style)
+            story.append(assets_table)
+            
+            # Build PDF
+            doc.build(story)
+            return True
+            
+        except Exception as e:
+            print(f"      -> ERROR generating PDF: {str(e)}")
+            return False
+    
     def generate_excel_consolidated(self):
         """Generate one Excel per person with all their assets"""
         df = self.read_csv_responses()
@@ -244,7 +485,9 @@ class SimpleExcelGenerator:
         
         # Normalize basic column names
         for col in df.columns:
-            if 'nama' in col.lower() and 'jenis' not in col.lower():
+            if 'timestamp' in col.lower():
+                df = df.rename(columns={col: 'Timestamp'})
+            elif 'nama' in col.lower() and 'jenis' not in col.lower():
                 df = df.rename(columns={col: 'Nama'})
             elif 'divisi' in col.lower():
                 df = df.rename(columns={col: 'Divisi'})
@@ -252,6 +495,10 @@ class SimpleExcelGenerator:
                 df = df.rename(columns={col: 'Area'})
             elif col.lower().strip() == 'pic':
                 df = df.rename(columns={col: 'PIC'})
+            elif 'dibuat' in col.lower() and 'oleh' in col.lower():
+                df = df.rename(columns={col: 'Dibuat Oleh'})
+            elif 'jabatan' in col.lower():
+                df = df.rename(columns={col: 'Jabatan'})
         
         # Group by person
         df['person_key'] = (
@@ -269,10 +516,13 @@ class SimpleExcelGenerator:
             if person_key not in grouped:
                 grouped[person_key] = {
                     'info': {
+                        'Timestamp': row.get('Timestamp', ''),
                         'Nama': row.get('Nama', 'Unknown'),
                         'Divisi': row.get('Divisi', 'Unknown'),
                         'Area': row.get('Area', 'Unknown'),
-                        'PIC': row.get('PIC', 'Unknown')
+                        'PIC': row.get('PIC', 'Unknown'),
+                        'Dibuat Oleh': row.get('Dibuat Oleh', ''),
+                        'Jabatan': row.get('Jabatan', '')
                     },
                     'assets': []
                 }
@@ -301,13 +551,26 @@ class SimpleExcelGenerator:
                 print(f"   -> {len(assets)} asset(s)")
                 for i, asset in enumerate(assets, 1):
                     print(f"      {i}. {asset['jenis']} | {asset['no']}")
+                
+                # Generate PDF if enabled
+                if self.enable_pdf:
+                    pdf_filename = filename.replace('.xlsx', '.pdf')
+                    pdf_path = os.path.join(self.pdf_folder, pdf_filename)
+                    print(f"   -> Generating PDF...")
+                    if self.generate_pdf(pdf_path, info, assets):
+                        print(f"   -> PDF created: {pdf_filename}")
+                    else:
+                        print(f"   -> PDF generation failed")
+                
                 success += 1
             else:
                 print(f"ERROR [{idx}/{len(grouped)}] Failed: {filename}")
         
         print(f"\n{'='*60}")
         print(f"OK Completed! {success}/{len(grouped)} files generated")
-        print(f"Files saved in: {os.path.abspath(self.output_folder)}")
+        print(f"Excel files saved in: {os.path.abspath(self.output_folder)}")
+        if self.enable_pdf:
+            print(f"PDF files saved in: {os.path.abspath(self.pdf_folder)}")
         print(f"{'='*60}")
     
     def generate_excel_separate(self):
@@ -319,7 +582,9 @@ class SimpleExcelGenerator:
         
         # Normalize column names
         for col in df.columns:
-            if 'nama' in col.lower() and 'jenis' not in col.lower():
+            if 'timestamp' in col.lower():
+                df = df.rename(columns={col: 'Timestamp'})
+            elif 'nama' in col.lower() and 'jenis' not in col.lower():
                 df = df.rename(columns={col: 'Nama'})
             elif 'divisi' in col.lower():
                 df = df.rename(columns={col: 'Divisi'})
@@ -327,16 +592,23 @@ class SimpleExcelGenerator:
                 df = df.rename(columns={col: 'Area'})
             elif col.lower().strip() == 'pic':
                 df = df.rename(columns={col: 'PIC'})
+            elif 'dibuat' in col.lower() and 'oleh' in col.lower():
+                df = df.rename(columns={col: 'Dibuat Oleh'})
+            elif 'jabatan' in col.lower():
+                df = df.rename(columns={col: 'Jabatan'})
         
         print(f"\nProcessing {len(df)} responses...\n")
         
         success = 0
         for idx, (_, row) in enumerate(df.iterrows(), 1):
             info = {
+                'Timestamp': row.get('Timestamp', ''),
                 'Nama': row.get('Nama', 'Unknown'),
                 'Divisi': row.get('Divisi', 'Unknown'),
                 'Area': row.get('Area', 'Unknown'),
-                'PIC': row.get('PIC', 'Unknown')
+                'PIC': row.get('PIC', 'Unknown'),
+                'Dibuat Oleh': row.get('Dibuat Oleh', ''),
+                'Jabatan': row.get('Jabatan', '')
             }
             
             assets = self.extract_assets_from_row(row)
@@ -353,13 +625,26 @@ class SimpleExcelGenerator:
                 print(f"   -> {len(assets)} asset(s)")
                 for i, asset in enumerate(assets, 1):
                     print(f"      {i}. {asset['jenis']} | {asset['no']}")
+                
+                # Generate PDF if enabled
+                if self.enable_pdf:
+                    pdf_filename = filename.replace('.xlsx', '.pdf')
+                    pdf_path = os.path.join(self.pdf_folder, pdf_filename)
+                    print(f"   -> Generating PDF...")
+                    if self.generate_pdf(pdf_path, info, assets):
+                        print(f"   -> PDF created: {pdf_filename}")
+                    else:
+                        print(f"   -> PDF generation failed")
+                
                 success += 1
             else:
                 print(f"ERROR [{idx}/{len(df)}] Failed: {filename}")
         
         print(f"\n{'='*60}")
         print(f"OK Completed! {success}/{len(df)} files generated")
-        print(f"Files saved in: {os.path.abspath(self.output_folder)}")
+        print(f"Excel files saved in: {os.path.abspath(self.output_folder)}")
+        if self.generate_pdf:
+            print(f"PDF files saved in: {os.path.abspath(self.pdf_folder)}")
         print(f"{'='*60}")
 
 
@@ -409,6 +694,14 @@ if __name__ == "__main__":
     insert_img = input("\nInsert images? (Y/N) [default=Y]: ").strip().upper() or "Y"
     
     generator.insert_images = (insert_img == "Y")
+    
+    # Ask if want to generate PDF
+    print("\nGenerate PDF files?")
+    print("  Y - Yes, create PDF alongside Excel (recommended)")
+    print("  N - No, Excel only")
+    gen_pdf = input("\nGenerate PDF? (Y/N) [default=Y]: ").strip().upper() or "Y"
+    
+    generator.enable_pdf = (gen_pdf == "Y")
     
     print()
     if mode == "1":
